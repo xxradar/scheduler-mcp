@@ -30,10 +30,61 @@ class TaskType(str, Enum):
 
 
 def sanitize_ascii(text: str) -> str:
-    """Strips non-ASCII characters from a string."""
+    """Strips non-ASCII characters and dangerous control characters from a string."""
     if not text:
         return text
-    return re.sub(r'[^\x00-\x7F]+', '', text)
+    # Remove non-ASCII characters and dangerous control characters (except printable ASCII)
+    # Keep only printable ASCII characters (0x20-0x7E) plus tab, newline, and carriage return
+    return re.sub(r'[^\x20-\x7E\x09\x0A\x0D]+', '', text)
+
+
+def validate_command_safety(command: str) -> tuple[bool, str]:
+    """
+    Validate that a command is safe to execute.
+    
+    Returns:
+        tuple: (is_safe, reason_if_unsafe)
+    """
+    if not command or not command.strip():
+        return False, "Empty command"
+    
+    # Remove comments to avoid bypassing checks
+    command_clean = re.sub(r'#.*$', '', command, flags=re.MULTILINE).strip()
+    
+    # Check for dangerous shell metacharacters and operators
+    dangerous_patterns = [
+        r'[;&|`$(){}[\]\\]',  # Shell metacharacters
+        r'[<>]',              # Redirections (simplified to catch both < and >)
+        r'<<?\s*\w+',         # Here documents
+        r'\|\s*\w+',          # Pipes to commands
+        r'&&|\|\|',           # Logic operators
+        r'\$\([^)]*\)',       # Command substitution
+        r'`[^`]*`',           # Backtick command substitution
+        r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]',  # Control characters (except tab, newline, CR)
+        r'\.\./.*\.\.',       # Path traversal patterns
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, command_clean):
+            return False, f"Command contains dangerous pattern: {pattern}"
+    
+    # Check for dangerous command prefixes (case insensitive)
+    dangerous_commands = [
+        r'\b(rm|del|erase)\s+(-[rf]+\s+)?/\w*',  # Dangerous deletion patterns
+        r'\b(wget|curl)\s+\w+://',               # Network access with URLs
+        r'\b(nc|ncat|netcat)\s+',                # Network tools  
+        r'\b(dd)\s+',                            # Disk tools
+        r'\b(chmod|chown)\s+',                   # Permission changes
+        r'\b(su|sudo)\s+',                       # Privilege escalation
+        r'\b(exec|eval)\s+',                     # Code execution
+        r'\b(python|perl|ruby|node|sh|bash)\s+', # Script interpreters
+    ]
+    
+    for pattern in dangerous_commands:
+        if re.search(pattern, command_clean, re.IGNORECASE):
+            return False, f"Command contains potentially dangerous operation: {pattern}"
+    
+    return True, ""
 
 
 class Task(BaseModel):
@@ -69,9 +120,15 @@ class Task(BaseModel):
 
     @validator("command")
     def validate_command(cls, v, values):
-        """Validate that a command is provided for shell_command tasks."""
-        if values.get("type") == TaskType.SHELL_COMMAND and not v:
-            raise ValueError("Command is required for shell_command tasks")
+        """Validate that a command is provided and safe for shell_command tasks."""
+        if values.get("type") == TaskType.SHELL_COMMAND:
+            if not v:
+                raise ValueError("Command is required for shell_command tasks")
+            
+            # Validate command safety
+            is_safe, reason = validate_command_safety(v)
+            if not is_safe:
+                raise ValueError(f"Unsafe command: {reason}")
         return v
     
     @validator("api_url")
