@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 
 import openai
 
-from .task import Task, TaskExecution, TaskStatus, TaskType
+from .task import Task, TaskExecution, TaskStatus, TaskType, validate_command_safety
 
 logger = logging.getLogger(__name__)
 
@@ -95,48 +95,52 @@ class Executor:
         return execution
     
     async def _execute_shell_command(self, command: str) -> Tuple[Optional[str], Optional[str]]:
-        """Execute a shell command with timeout."""
+        """Execute a shell command with timeout and security validation."""
         if not command:
             return None, "No command specified"
         
-        # Determine if we need to use shell mode
-        use_shell = self.is_windows
+        # Validate command safety first
+        is_safe, reason = validate_command_safety(command)
+        if not is_safe:
+            return None, f"Command rejected for security reasons: {reason}"
         
-        # These commands are shell builtins and need shell=True
-        shell_commands = ['start', 'cd', 'dir', 'echo', 'set', 'type', 'copy', 'del', 'md', 'rd', 'ren', 'cls']
+        # Determine if we need to use shell mode (only for specific cases)
+        use_shell = False
         
-        # If command starts with any of these, use shell mode
-        if any(command.strip().lower().startswith(cmd) for cmd in shell_commands):
-            use_shell = True
+        # Only use shell mode for specific Windows built-ins that require it
+        if self.is_windows:
+            windows_builtins = ['dir', 'echo', 'set', 'type', 'copy', 'del', 'md', 'rd', 'ren', 'cls', 'cd']
+            command_first_word = command.strip().split()[0].lower()
+            if command_first_word in windows_builtins:
+                use_shell = True
         
-        # If pipe or redirect is in command, use shell mode
-        if '|' in command or '>' in command or '<' in command:
-            use_shell = True
-            
+        # For most commands, use direct execution which is safer
         logger.info(f"Executing command: {command} (shell mode: {use_shell})")
         
         try:
-            if use_shell:
-                # Use shell mode for Windows or shell-specific commands
-                if self.is_windows:
-                    # Force cmd.exe on Windows
-                    full_command = f"cmd.exe /c {command}"
-                else:
-                    full_command = command
+            if use_shell and self.is_windows:
+                # Use shell mode only for Windows built-ins
+                # Escape the command properly for cmd.exe
+                escaped_command = shlex.quote(command) if not self.is_windows else command
+                full_command = f"cmd.exe /c {escaped_command}"
                 
                 process = await asyncio.create_subprocess_shell(
                     full_command,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    shell=True
+                    stderr=asyncio.subprocess.PIPE
                 )
             else:
-                # Use direct execution for standard commands
+                # Use direct execution for better security
                 try:
+                    # Parse command into arguments safely
                     args = shlex.split(command)
+                    if not args:
+                        return None, "Empty command after parsing"
+                        
                 except ValueError as e:
                     return None, f"Invalid command syntax: {str(e)}"
                 
+                # Execute directly without shell
                 process = await asyncio.create_subprocess_exec(
                     *args,
                     stdout=asyncio.subprocess.PIPE,
@@ -150,14 +154,20 @@ class Executor:
                 )
                 
                 if process.returncode != 0:
-                    error_msg = stderr.decode() if stderr else "Unknown error"
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
                     return None, f"Command failed with exit code {process.returncode}: {error_msg}"
                 
-                return stdout.decode().strip(), None
+                # Limit output size to prevent resource exhaustion
+                output = stdout.decode().strip()
+                if len(output) > 50000:  # Limit to 50KB
+                    output = output[:50000] + "\n... (output truncated)"
+                
+                return output, None
                 
             except asyncio.TimeoutError:
                 try:
                     process.kill()
+                    await process.wait()
                 except Exception:
                     pass
                 return None, f"Command timed out after {self.execution_timeout} seconds"
@@ -231,165 +241,195 @@ class Executor:
         if not message:
             return None, "No message specified for reminder"
         
+        # Sanitize inputs to prevent command injection
+        safe_title = self._sanitize_for_shell(title) if title else "Reminder"
+        safe_message = self._sanitize_for_shell(message)
+        
+        if not safe_title or not safe_message:
+            return None, "Title or message contains unsafe characters"
+        
         os_type = platform.system()
-        command = None
         
         try:
-            # Generate platform-specific notification commands
+            # Generate platform-specific notification commands using safe execution
             if os_type == "Windows":
-                # Escape single quotes for VBScript
-                safe_title = title.replace("'", "''")
-                safe_message = message.replace("'", "''")
-                
-                # Create a temporary HTML file for the notification
-                temp_dir = os.path.join(os.environ.get('TEMP', ''), '')
-                temp_html = os.path.join(temp_dir, 'notification.hta')
-                
-                # Use VBScript instead of JavaScript for playing sounds
-                with open(temp_html, 'w') as f:
-                    f.write(f'''
-                    <html>
-                    <head>
-                    <title>{safe_title}</title>
-                    <hta:application
-                        id="notification"
-                        applicationname="Notification"
-                        border="thin"
-                        borderstyle="normal"
-                        caption="yes"
-                        contextmenu="no"
-                        icon=""
-                        maximizebutton="no"
-                        minimizebutton="yes"
-                        navigable="no"
-                        showintaskbar="yes"
-                        singleinstance="yes"
-                        sysmenu="yes"
-                        version="1.0"
-                        windowstate="normal"
-                    />
-                    <style>
-                        body {{
-                            font-family: Arial, sans-serif;
-                            padding: 20px;
-                            background-color: #f0f0f0;
-                            width: 300px;
-                            height: 150px;
-                        }}
-                        h2 {{
-                            color: #333;
-                            margin-top: 0;
-                        }}
-                        p {{
-                            color: #555;
-                        }}
-                        button {{
-                            padding: 5px 15px;
-                            margin-top: 15px;
-                            border: none;
-                            background-color: #0078d7;
-                            color: white;
-                            cursor: pointer;
-                        }}
-                    </style>
-                    <script language="VBScript">
-                        Sub Window_OnLoad
-                            ' Play the notification sound
-                            Set oShell = CreateObject("WScript.Shell")
-                            oShell.Run "rundll32 user32.dll,MessageBeep", 0, False
-                        End Sub
-                        
-                        Sub CloseButton_OnClick
-                            window.close
-                        End Sub
-                        
-                        Sub Window_OnLoad
-                            ' Auto-close after 30 seconds
-                            setTimeout 30000, "window.close"
-                        End Sub
-                        
-                        Sub setTimeout(ms, expr)
-                            CreateObject("WScript.Shell").Run "ping -n " & Int(ms/1000 + 2) & " 127.0.0.1 > nul && mshta vbscript:close(Execute(""window.close""))", 0, False
-                        End Sub
-                    </script>
-                    </head>
-                    <body>
-                        <h2>{safe_title}</h2>
-                        <p>{safe_message}</p>
-                        <button onclick="CloseButton_OnClick">OK</button>
-                    </body>
-                    </html>
-                    ''')
-                
-                # Use mshta to display the notification
-                command = f'start mshta.exe "{temp_html}"'
-                
-                # Also run a direct MessageBeep as backup
-                backup_command = f'rundll32 user32.dll,MessageBeep'
-                await self._execute_shell_command(backup_command)
-                
+                return await self._windows_notification(safe_title, safe_message)
             elif os_type == "Darwin":  # macOS
-                # Escape double quotes in the osascript command
-                safe_title = title.replace('"', '\\"')
-                safe_message = message.replace('"', '\\"')
-                # Use the "default" sound which is guaranteed to work
-                command = f'osascript -e \'display notification "{safe_message}" with title "{safe_title}" sound name "default"\''
-                
+                return await self._macos_notification(safe_title, safe_message)
             else:  # Linux and others
-                # Escape quotes in the notify-send command
-                safe_title = title.replace('"', '\\"')
-                safe_message = message.replace('"', '\\"')
-                
-                # Try paplay with notify-send for sound on Linux
-                notify_cmd = f'notify-send -u normal "{safe_title}" "{safe_message}"'
-                sound_cmd = 'paplay /usr/share/sounds/freedesktop/stereo/message.oga'
-                
-                # Chain commands together
-                command = f'{notify_cmd} && {sound_cmd}'
-                
-                # Check if notify-send exists
-                notify_send_check = await asyncio.create_subprocess_shell(
-                    "which notify-send",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await notify_send_check.communicate()
-                
-                if notify_send_check.returncode != 0:
-                    # Fallback to zenity with sound
-                    zenity_check = await asyncio.create_subprocess_shell(
-                        "which zenity",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    await zenity_check.communicate()
-                    
-                    if zenity_check.returncode == 0:
-                        command = f'zenity --info --title="{safe_title}" --text="{safe_message}" & {sound_cmd}'
-                    else:
-                        # Last resort: try xmessage with a sound command
-                        xmessage_check = await asyncio.create_subprocess_shell(
-                            "which xmessage",
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        await xmessage_check.communicate()
-                        
-                        if xmessage_check.returncode == 0:
-                            command = f'xmessage -center "{safe_title}: {safe_message}" & {sound_cmd}'
-                        else:
-                            return None, f"No notification command available on this system ({os_type})"
-            
-            if command:
-                # Execute the notification command
-                output, error = await self._execute_shell_command(command)
-                if error:
-                    return None, f"Notification failed: {error}"
-                
-                return f"Displayed notification: {title}", None
-            else:
-                return None, "Failed to create notification command"
+                return await self._linux_notification(safe_title, safe_message)
                 
         except Exception as e:
             logger.exception("Error in reminder task")
             return None, f"Reminder task failed: {str(e)}"
+    
+    def _sanitize_for_shell(self, text: str) -> str:
+        """Sanitize text for safe use in shell commands."""
+        if not text:
+            return ""
+        
+        # Remove or replace dangerous characters
+        import re
+        # Keep only alphanumeric, spaces, and basic punctuation
+        sanitized = re.sub(r'[^\w\s\-.,!?()[\]{}:;]', '', text)
+        # Limit length to prevent issues
+        return sanitized[:200] if sanitized else ""
+    
+    async def _windows_notification(self, title: str, message: str) -> Tuple[Optional[str], Optional[str]]:
+        """Show Windows notification safely."""
+        try:
+            # Use PowerShell with proper escaping instead of VBScript/HTA
+            # This is much safer than generating HTML files
+            ps_command = [
+                "powershell.exe",
+                "-Command",
+                f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{message}', '{title}', 'OK', 'Information')"
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *ps_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.execution_timeout
+                )
+                
+                if process.returncode == 0:
+                    # Also play a sound
+                    sound_command = ["rundll32", "user32.dll,MessageBeep", "0"]
+                    sound_process = await asyncio.create_subprocess_exec(
+                        *sound_command,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await sound_process.wait()
+                    
+                    return f"Displayed Windows notification: {title}", None
+                else:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    return None, f"Windows notification failed: {error_msg}"
+                    
+            except asyncio.TimeoutError:
+                process.kill()
+                return None, "Windows notification timed out"
+                
+        except Exception as e:
+            return None, f"Windows notification error: {str(e)}"
+    
+    async def _macos_notification(self, title: str, message: str) -> Tuple[Optional[str], Optional[str]]:
+        """Show macOS notification safely."""
+        try:
+            # Use osascript with proper argument array (safer than shell interpolation)
+            os_command = [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}" sound name "default"'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *os_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.execution_timeout
+                )
+                
+                if process.returncode == 0:
+                    return f"Displayed macOS notification: {title}", None
+                else:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    return None, f"macOS notification failed: {error_msg}"
+                    
+            except asyncio.TimeoutError:
+                process.kill()
+                return None, "macOS notification timed out"
+                
+        except Exception as e:
+            return None, f"macOS notification error: {str(e)}"
+    
+    async def _linux_notification(self, title: str, message: str) -> Tuple[Optional[str], Optional[str]]:
+        """Show Linux notification safely."""
+        try:
+            # Try notify-send first with proper argument array
+            notify_command = ["notify-send", "-u", "normal", title, message]
+            
+            process = await asyncio.create_subprocess_exec(
+                *notify_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.execution_timeout
+                )
+                
+                if process.returncode == 0:
+                    # Try to play a sound separately
+                    sound_commands = [
+                        ["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"],
+                        ["aplay", "/usr/share/sounds/alsa/Front_Left.wav"],
+                        ["beep"],
+                    ]
+                    
+                    for sound_cmd in sound_commands:
+                        try:
+                            sound_process = await asyncio.create_subprocess_exec(
+                                *sound_cmd,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL
+                            )
+                            await asyncio.wait_for(sound_process.wait(), timeout=2)
+                            break  # If one works, we're done
+                        except:
+                            continue  # Try next sound command
+                    
+                    return f"Displayed Linux notification: {title}", None
+                else:
+                    # Try zenity as fallback
+                    return await self._linux_zenity_notification(title, message)
+                    
+            except asyncio.TimeoutError:
+                process.kill()
+                return None, "Linux notification timed out"
+                
+        except Exception as e:
+            return await self._linux_zenity_notification(title, message)
+    
+    async def _linux_zenity_notification(self, title: str, message: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fallback Linux notification using zenity."""
+        try:
+            zenity_command = ["zenity", "--info", f"--title={title}", f"--text={message}"]
+            
+            process = await asyncio.create_subprocess_exec(
+                *zenity_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.execution_timeout
+                )
+                
+                if process.returncode == 0:
+                    return f"Displayed Linux notification (zenity): {title}", None
+                else:
+                    return None, f"No suitable notification method found on Linux"
+                    
+            except asyncio.TimeoutError:
+                process.kill()
+                return None, "Linux zenity notification timed out"
+                
+        except Exception as e:
+            return None, f"Linux notification fallback failed: {str(e)}"
